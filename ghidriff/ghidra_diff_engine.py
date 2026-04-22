@@ -76,7 +76,8 @@ class GhidraDiffEngine(GhidriffMarkdown, metaclass=ABCMeta):
             bsim_full: bool = False,
             gdts: list = [],
             base_address: int = None,
-            program_options: dict = None) -> None:
+            program_options: dict = None,
+            decomp_data_path: str = None) -> None:
 
         # setup engine logging
         self.logger = self.setup_logger(engine_log_level)
@@ -165,6 +166,7 @@ class GhidraDiffEngine(GhidriffMarkdown, metaclass=ABCMeta):
 
         self.gdts = gdts
         self.base_address = base_address
+        self.decomp_data_path = Path(decomp_data_path) if decomp_data_path else None
         if program_options is not None:
             self.program_options = json.loads(Path(program_options).read_text())
         else:
@@ -219,6 +221,9 @@ class GhidraDiffEngine(GhidriffMarkdown, metaclass=ABCMeta):
         group.add_argument('-n', '--project-name', help='Ghidra Project Name', default='ghidriff')
         group.add_argument('-s', '--symbols-path', help='Ghidra local symbol store directory', default='symbols')
         group.add_argument('-g', '--gzfs-path', help='Location to store GZFs of analyzed binaries', default='gzfs')
+        group.add_argument('--decomp-data-path',
+                           help='If set, dump per-function .c/.asm and metadata.json for each analyzed binary under <path>/<bin>/',
+                           default=None)
         group.add_argument('--ba', '--base-address', dest='base_address', type=_parse_ba,
                            help='Set base address from both programs. 0x2000 or 8192'),
         group.add_argument('--program-options', type=_load_program_options,
@@ -949,6 +954,11 @@ class GhidraDiffEngine(GhidriffMarkdown, metaclass=ABCMeta):
             if self.gzfs_path is not None:
                 from java.io import File
                 self.project.saveAsPackedFile(program, File((self.gzfs_path / f"{df_or_prog.getName()}.gzf").absolute()), True)
+            # optionally dump per-binary decomp + metadata
+            try:
+                self.dump_program_data(program)
+            except Exception:
+                self.logger.exception(f"Failed to dump decomp data for {program}")
             self.project.close(program)
 
         self.logger.info(f"Analysis for {df_or_prog} complete")
@@ -1350,6 +1360,110 @@ class GhidraDiffEngine(GhidriffMarkdown, metaclass=ABCMeta):
         """
 
         return '-'.join((path.name, sha1_file(path.absolute())[:6]))
+
+    def dump_program_data(self, program) -> None:
+        """
+        Dump per-function decompiled .c/.asm files and a metadata.json (strings,
+        string references, caller/callee relations) under self.decomp_data_path/<binary>.
+        No-op if self.decomp_data_path is None or if metadata.json already exists.
+        """
+        if self.decomp_data_path is None:
+            return
+
+        from ghidra.app.decompiler import DecompInterface, DecompileOptions
+        from ghidra.program.util import DefinedDataIterator
+        from ghidra.util.task import ConsoleTaskMonitor
+
+        exec_path = program.getExecutablePath()
+        bin_name = Path(exec_path).name if exec_path else program.getName()
+        out_dir = self.decomp_data_path / bin_name
+        metadata_file = out_dir / "metadata.json"
+
+        if metadata_file.exists():
+            self.logger.info(f"Decomp dump already present for {bin_name}, skipping")
+            return
+
+        self.logger.info(f"Dumping decomp data for {bin_name}...")
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        monitor = ConsoleTaskMonitor()
+        decomp = DecompInterface()
+        decomp.setOptions(DecompileOptions())
+        decomp.openProgram(program)
+        try:
+            listing = program.getListing()
+            func_mgr = program.getFunctionManager()
+            ref_mgr = program.getReferenceManager()
+
+            all_funcs = [f for f in func_mgr.getFunctions(True)
+                         if not f.isExternal() and not f.isThunk()]
+
+            functions_meta = []
+            for func in all_funcs:
+                entry = func.getEntryPoint()
+                entry_hex = hex(entry.getOffset())
+                end = func.getBody().getMaxAddress()
+
+                result = decomp.decompileFunction(func, 180, monitor)
+                if result.decompileCompleted():
+                    (out_dir / f"{entry_hex}.c").write_text(
+                        result.getDecompiledFunction().getC(), "utf-8", "replace")
+
+                insns = listing.getInstructions(entry, True)
+                asm_lines = []
+                while insns.hasNext():
+                    ins = insns.next()
+                    if ins.getAddress().compareTo(end) > 0:
+                        break
+                    asm_lines.append(f"{hex(ins.getAddress().getOffset())}: {ins}")
+                (out_dir / f"{entry_hex}.asm").write_text(
+                    "\n".join(asm_lines), "utf-8", "replace")
+
+                callers = [{"address": hex(c.getEntryPoint().getOffset()), "name": c.getName()}
+                           for c in func.getCallingFunctions(monitor)]
+                callees = [{"address": hex(c.getEntryPoint().getOffset()), "name": c.getName()}
+                           for c in func.getCalledFunctions(monitor)]
+                functions_meta.append({
+                    "address": entry_hex,
+                    "name": func.getName(),
+                    "callers": callers,
+                    "callees": callees,
+                })
+
+            strings_meta = []
+            refs_meta = []
+            for data in DefinedDataIterator.definedStrings(program):
+                addr = data.getAddress()
+                addr_hex = hex(addr.getOffset())
+                try:
+                    value = str(data.getValue())
+                except Exception:
+                    value = ""
+                strings_meta.append({
+                    "address": addr_hex,
+                    "value": value,
+                    "length": data.getLength(),
+                })
+                for ref in ref_mgr.getReferencesTo(addr):
+                    from_addr = ref.getFromAddress()
+                    containing = func_mgr.getFunctionContaining(from_addr)
+                    refs_meta.append({
+                        "string_address": addr_hex,
+                        "from_address": hex(from_addr.getOffset()),
+                        "from_function": (hex(containing.getEntryPoint().getOffset())
+                                          if containing else None),
+                    })
+
+            metadata = {
+                "binary": bin_name,
+                "strings": strings_meta,
+                "string_references": refs_meta,
+                "functions": functions_meta,
+            }
+            metadata_file.write_text(json.dumps(metadata), "utf-8")
+            self.logger.info(f"Wrote decomp data for {bin_name} to {out_dir}")
+        finally:
+            decomp.dispose()
 
     def normalize_ghidra_decomp(self, code: list):
         """
