@@ -146,6 +146,7 @@ class GhidraDiffEngine(GhidriffMarkdown, metaclass=ABCMeta):
         self.decompilers = {}
 
         self.project: "ghidra.base.project.GhidraProject" = None
+        self.projects: dict = {}  # program_name -> GhidraProject (one per binary)
 
         self.version = __version__
 
@@ -477,8 +478,8 @@ class GhidraDiffEngine(GhidriffMarkdown, metaclass=ABCMeta):
         from ghidra.app.plugin.core.analysis import PdbAnalyzer
         from ghidra.app.plugin.core.analysis import PdbUniversalAnalyzer
 
-        project_location = Path(project_location) / project_name
-        project_location.mkdir(exist_ok=True, parents=True)
+        base_location = Path(project_location)
+        base_location.mkdir(exist_ok=True, parents=True)
 
         if gzfs_path is not None:
             gzfs_path = Path(gzfs_path)
@@ -489,28 +490,18 @@ class GhidraDiffEngine(GhidriffMarkdown, metaclass=ABCMeta):
 
         self.logger.info(f'Setting Up Ghidra Project...')
 
-        # Open/Create project
-        project = None
-
+        # Close any previously open projects
         if self.project is not None:
             self.logger.warning("Project Already Open! Closing project and saving")
             self.project.project.save()
             self.project.close()
             self.project = None
-
-        try:
-            project = GhidraProject.openProject(project_location, project_name, True)
-            self.logger.info(f'Opened project: {project.project.name}')
-        except (IOException, NotFoundException):
-            project = GhidraProject.createProject(project_location, project_name, False)
-            self.logger.info(f'Created project: {project.project.name}')
-
-        self.project = project
-
-        self.logger.info(f'Project Location: {project.project.projectLocator.location}')
+        for _proj in self.projects.values():
+            _proj.close()
+        self.projects = {}
 
         bin_results = []
-        proj_programs = []
+        proj_programs = []  # list of (project, program) tuples
 
         # remove duplicate paths, maintain order
         import_paths = list(dict.fromkeys(binary_paths))
@@ -524,20 +515,35 @@ class GhidraDiffEngine(GhidriffMarkdown, metaclass=ABCMeta):
             else:
                 bin_hashes.append(bin_hash)
 
-        # Import binaries and configure symbols
+        # Import binaries — each gets its own per-binary project
         for program_path in import_paths:
 
             # add sha1 to prevent files with same name collision
             program_name = self.gen_proj_bin_name_from_path(program_path)
 
-            # Import binaries and configure symbols
+            per_bin_location = base_location / program_name
+            per_bin_location.mkdir(exist_ok=True, parents=True)
+
+            try:
+                project = GhidraProject.openProject(per_bin_location, program_name, True)
+                self.logger.info(f'Opened project: {project.project.name}')
+            except (IOException, NotFoundException):
+                project = GhidraProject.createProject(per_bin_location, program_name, False)
+                self.logger.info(f'Created project: {project.project.name}')
+
+            self.projects[program_name] = project
+            self.project = project  # keep last for backward compat
+
+            self.logger.info(f'Project Location: {project.project.projectLocator.location}')
+
+            # Import binary and configure symbols
             if not project.getRootFolder().getFile(program_name):
                 self.logger.info(f'Importing {program_path} as {program_name}')
                 program = project.importProgram(program_path)
                 project.saveAs(program, "/", program_name, True)
             else:
                 self.logger.info(f'Opening {program_path}')
-                program = self.project.openProgram("/", program_name, False)
+                program = project.openProgram("/", program_name, False)
 
             self.logger.info(f'Loaded {program}')
 
@@ -551,16 +557,17 @@ class GhidraDiffEngine(GhidriffMarkdown, metaclass=ABCMeta):
             else:
                 self.logger.info(f'Image base address: 0x{img_base}')
 
-            proj_programs.append(program)
+            proj_programs.append((project, program))
 
-        # Print of project files
+        # Print project files
         self.logger.info('Project Files:')
-        for df in self.project.getRootFolder().getFiles():
-            self.logger.info(df)
+        for prog_name, proj in self.projects.items():
+            for df in proj.getRootFolder().getFiles():
+                self.logger.info(df)
 
         # Setup Symbols Server
         if not self.no_symbols:
-            if any(self.prog_is_windows(prog) for prog in proj_programs):
+            if any(self.prog_is_windows(prog) for _, prog in proj_programs):
                 # Windows level 1 symbol server location
                 level = 1
             else:
@@ -568,7 +575,7 @@ class GhidraDiffEngine(GhidriffMarkdown, metaclass=ABCMeta):
                 level = 0
             self.setup_symbol_server(symbols_path, level, server_urls=symbol_urls)
 
-        for program in proj_programs:
+        for proj, program in proj_programs:
 
             if not self.no_symbols:
                 # Enable Remote Symbol Servers
@@ -606,7 +613,7 @@ class GhidraDiffEngine(GhidriffMarkdown, metaclass=ABCMeta):
 
             bin_results.append([program.getDomainFile().name, imported, has_pdb, pdb_loaded, prog_analyzed])
 
-            project.close(program)
+            proj.close(program)
 
         for result in bin_results:
             self.logger.info('Program: %s imported: %s has_pdb: %s pdb_loaded: %s analyzed %s', *result)
@@ -858,7 +865,7 @@ class GhidraDiffEngine(GhidriffMarkdown, metaclass=ABCMeta):
                                         always_replace, createBookmarksEnabled)
         cmd.applyTo(program, monitor)
 
-    def analyze_program(self, df_or_prog: Union["ghidra.framework.model.DomainFile", "ghidra.program.model.listing.Program"], require_symbols: bool, force_analysis: bool = False, verbose_analysis: bool = False):
+    def analyze_program(self, df_or_prog: Union["ghidra.framework.model.DomainFile", "ghidra.program.model.listing.Program"], require_symbols: bool, force_analysis: bool = False, verbose_analysis: bool = False, project=None):
 
         from ghidra.program.flatapi import FlatProgramAPI
         from ghidra.framework.model import DomainFile
@@ -868,8 +875,10 @@ class GhidraDiffEngine(GhidriffMarkdown, metaclass=ABCMeta):
         from ghidra.app.script import GhidraScriptUtil
         from ghidra.app.util.pdb import PdbProgramAttributes
 
+        _project = project or self.project
+
         if isinstance(df_or_prog, DomainFile):
-            program = self.project.openProgram("/", df_or_prog.getName(), False)
+            program = _project.openProgram("/", df_or_prog.getName(), False)
         elif isinstance(df_or_prog, Program):
             program = df_or_prog
 
@@ -946,20 +955,20 @@ class GhidraDiffEngine(GhidriffMarkdown, metaclass=ABCMeta):
                         raise Exception('Missing set analyzed flag method!')
                 finally:
                     GhidraScriptUtil.releaseBundleHostReference()
-                    self.project.save(program)
+                    _project.save(program)
             else:
                 self.logger.info(f"Analysis already complete.. skipping {program}!")
         finally:
             # optionally save GZF
             if self.gzfs_path is not None:
                 from java.io import File
-                self.project.saveAsPackedFile(program, File((self.gzfs_path / f"{df_or_prog.getName()}.gzf").absolute()), True)
+                _project.saveAsPackedFile(program, File((self.gzfs_path / f"{df_or_prog.getName()}.gzf").absolute()), True)
             # optionally dump per-binary decomp + metadata
             try:
                 self.dump_program_data(program)
             except Exception:
                 self.logger.exception(f"Failed to dump decomp data for {program}")
-            self.project.close(program)
+            _project.close(program)
 
         self.logger.info(f"Analysis for {df_or_prog} complete")
 
@@ -969,23 +978,28 @@ class GhidraDiffEngine(GhidriffMarkdown, metaclass=ABCMeta):
         """
         Analyzes all files found within the project
         """
-        self.logger.info(f'Starting analysis for {len(self.project.getRootFolder().getFiles())} binaries')
+        all_domain_files = [
+            (proj, df)
+            for proj in self.projects.values()
+            for df in proj.getRootFolder().getFiles()
+            if df.getContentType() == 'Program'
+        ]
+        self.logger.info(f'Starting analysis for {len(all_domain_files)} binaries')
 
         completed_count = 0
-        prog_count = len([domainFile for domainFile in self.project.getRootFolder().getFiles()
-                         if domainFile.getContentType() == 'Program'])
+        prog_count = len(all_domain_files)
 
         if self.threaded:
             with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                futures = (executor.submit(self.analyze_program, *[domainFile, require_symbols, force_analysis, verbose_analysis])
-                           for domainFile in self.project.getRootFolder().getFiles() if domainFile.getContentType() == 'Program')
+                futures = (executor.submit(self.analyze_program, df, require_symbols, force_analysis, verbose_analysis, proj)
+                           for proj, df in all_domain_files)
                 for future in concurrent.futures.as_completed(futures):
                     completed_count += 1
                     self.logger.info(f"Analyis % complete: {round(completed_count/prog_count, 2)*100}")
-                    prog = future.result()
+                    future.result()
         else:
-            for domainFile in self.project.getRootFolder().getFiles():
-                self.analyze_program(domainFile, require_symbols, force_analysis)
+            for proj, df in all_domain_files:
+                self.analyze_program(df, require_symbols, force_analysis, project=proj)
 
     def get_metadata(
         self,
@@ -1527,27 +1541,30 @@ class GhidraDiffEngine(GhidriffMarkdown, metaclass=ABCMeta):
         # analysis options used
         pdiff['program_options'] = {}
 
+        p1_project = self.projects.get(p1_name, self.project)
+        p2_project = self.projects.get(p2_name, self.project)
+
         # need RW program to get full options
-        p1 = self.project.openProgram("/", p1_name, False)
+        p1 = p1_project.openProgram("/", p1_name, False)
 
         if p1_name == p2_name:
             self.logger.warn(f'Diffed files have the same content. Are you sure you want to do this??')
             p2 = p1
         else:
-            p2 = self.project.openProgram("/", p2_name, False)
+            p2 = p2_project.openProgram("/", p2_name, False)
 
         pdiff['program_options'][p1.name] = self.get_all_program_options(p1)
         pdiff['program_options'][p2.name] = self.get_all_program_options(p2)
 
-        self.project.close(p1)
-        self.project.close(p2)
+        p1_project.close(p1)
+        p2_project.close(p2)
 
         # now open both programs read-only
-        p1 = self.project.openProgram("/", p1_name, True)
+        p1 = p1_project.openProgram("/", p1_name, True)
         if p1_name == p2_name:
             p2 = p1
         else:
-            p2 = self.project.openProgram("/", p2_name, True)
+            p2 = p2_project.openProgram("/", p2_name, True)
 
         # setup decompilers
         self.setup_decompliers(p1, p2)
@@ -1865,8 +1882,8 @@ class GhidraDiffEngine(GhidriffMarkdown, metaclass=ABCMeta):
         # reset global esym OTHERWISE this gets big
         self.esym_memo = {}
 
-        self.project.close(p1)
-        self.project.close(p2)
+        p1_project.close(p1)
+        p2_project.close(p2)
 
         self.logger.info("Finished diffing old program: {}".format(p1.getName()))
         self.logger.info("Finished diffing program: {}".format(p2.getName()))
