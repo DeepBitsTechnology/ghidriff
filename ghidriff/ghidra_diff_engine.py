@@ -1385,7 +1385,7 @@ class GhidraDiffEngine(GhidriffMarkdown, metaclass=ABCMeta):
             return
 
         from ghidra.app.decompiler import DecompInterface, DecompileOptions
-        from ghidra.program.util import DefinedDataIterator
+        from ghidra.program.util import DefinedStringIterator
         from ghidra.util.task import ConsoleTaskMonitor
 
         exec_path = program.getExecutablePath()
@@ -1446,7 +1446,7 @@ class GhidraDiffEngine(GhidriffMarkdown, metaclass=ABCMeta):
 
             strings_meta = []
             refs_meta = []
-            for data in DefinedDataIterator.definedStrings(program):
+            for data in DefinedStringIterator.forProgram(program):
                 addr = data.getAddress()
                 addr_hex = hex(addr.getOffset())
                 try:

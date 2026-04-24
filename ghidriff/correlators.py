@@ -327,15 +327,9 @@ def get_defined_data(program: "ghidra.program.model.listing.Program"):
 
     # from java.util import CollectionUtils
     from ghidra.program.model.data import StringDataInstance
-    from ghidra.program.util import DefinedDataIterator
+    from ghidra.program.util import DefinedStringIterator
 
-    if hasattr(DefinedDataIterator, 'definedStrings'):
-        str_data_iter = DefinedDataIterator.definedStrings(program)
-    else:
-        from ghidra.program.model.data import StringDataType
-        str_data_iter = DefinedDataIterator.byDataType(program, lambda x: isinstance(x, StringDataType))
-
-    for data in str_data_iter:
+    for data in DefinedStringIterator.forProgram(program):
         sdi_str = StringDataInstance.getStringDataInstance(data)
         s = sdi_str.getStringValue()
         if s != None:
